@@ -1,8 +1,27 @@
-# 🛡️ AI 智能售后助手与安全中枢
+# 🛡️ AI 智能售后助手与安全中枢 (Agent Audit System)
 
 🚀 **在线体验 Demo:** [点击这里立即体验](https://agent-audit-system-ond5cicvtijaa2jc3p7sri.streamlit.app/)
-
 > 💡 **测试提示**：点击界面左侧的“越权攻击”按钮，体验系统如何实时拦截 AI 的非法操作。
+
+## 📖 项目简介
+针对大模型 Agent 在真实业务中易产生越权误操作、死循环及成本失控的痛点，本项目从零开发了一套集持久化存储、全链路 Trace 追踪与前置策略门禁于一体的安全风控系统。
+
+## ✨ 核心特性
+- **👁️ 全链路 Trace 追踪**：结构化记录模型思考、工具调用、参数来源及策略判定，精准定位首错步。
+- **🛡️ 策略门禁 (Policy Engine)**：在工具执行前拦截跨用户退款、重复退款等非法操作，确保非法请求下业务副作用为 0。
+- **🛑 防死循环与成本熔断**：限制最大执行步数，预估 Token 消耗，防止 API 成本失控。
+- **💾 真实数据持久化**：基于 SQLite 实现订单状态的持久化与事务回滚验证。
+- **⚙️ 前后端分离架构**：提供标准化的 FastAPI 后端审计接口，支持企业级系统无缝接入。
+
+## 🛠️ 技术栈
+Python, FastAPI, Streamlit, DeepSeek API, SQLite, Pytest, Git
+
+## 🚀 本地运行指南
+1. 克隆代码：`git clone 你的仓库地址`
+2. 安装依赖：`pip install -r requirements.txt`
+3. 配置环境变量：参考 `.env.example` 创建 `.env`，填入 `DEEPSEEK_API_KEY`
+4. 启动前端：`streamlit run ui/app.py`
+5. 启动后端 API：`uvicorn main:app --reload`
 # 订单客服 Agent · 行为审计与安全门禁
 
 > 模型负责决策，策略负责兜底，轨迹负责复盘。
