@@ -45,6 +45,7 @@ orders.db-wal
 orders.db-shm
 trace/trace.jsonl
 trace/ui_*.jsonl
+trace/api_*.jsonl
 *.log
 
 # ---------------------------------------------------------------------------

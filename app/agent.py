@@ -67,6 +67,7 @@ __all__ = [
     "OrderAgent",
     "RunResult",
     "find_first_error",
+    "answer_from_case",
     "run_case",
     "parse_decision",
     "load_dotenv",
@@ -498,6 +499,44 @@ def find_first_error(trace: Sequence[Mapping[str, Any]]) -> Optional[Dict[str, A
             "reason": policy_info.get("reason") or error,
         }
     return None
+
+
+def answer_from_case(case: Mapping[str, Any]) -> str:
+    """从 run_case() 结果中提取给用户的自然语言回复。
+
+    优先使用 finish 步骤的 final_answer；若没有 finish，则根据硬熔断或策略拦截
+    给出可读的兜底文案。API 与 Streamlit 面板共用这一逻辑。
+    """
+
+    trace = case.get("trace") or []
+
+    for step in reversed(trace):
+        if step.get("outcome") == "finished":
+            args = step.get("args") or {}
+            answer = args.get("final_answer") or args.get("answer") or step.get("thought")
+            if answer:
+                return str(answer)
+
+    last = trace[-1] if trace else {}
+    if last.get("breaker") == BREAKER_MAX_STEPS:
+        return "抱歉，这次处理步骤过多，系统已自动中止，请换一种说法再试。"
+    if last.get("breaker") == BREAKER_COST_LIMIT:
+        return "抱歉，本次会话的预估成本已达到上限，系统已自动中止。"
+
+    denied = [
+        step
+        for step in trace
+        if isinstance(step.get("policy"), Mapping)
+        and not step["policy"].get("allowed", True)
+    ]
+    if denied:
+        info = denied[-1].get("policy") or {}
+        return (
+            "抱歉，这个操作被安全门禁拦截了："
+            f"{info.get('reason') or '不符合当前操作规则'}。"
+        )
+
+    return "抱歉，我暂时没能完成这个请求，请换个说法再试。"
 
 
 # --------------------------------------------------------------------------- #

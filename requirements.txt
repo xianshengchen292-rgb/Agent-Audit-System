@@ -1,4 +1,8 @@
 # 核心 Agent / 策略 / 轨迹只使用 Python 标准库（3.10+）。
-# 审计面板需要 Streamlit（会一并安装 pandas 等依赖）。
-# >=1.40 支持在 columns 内联使用 st.chat_input。
+# API 服务
+fastapi>=0.110
+uvicorn[standard]>=0.27
+# FastAPI TestClient 依赖（测试用）
+httpx>=0.27
+# 审计面板
 streamlit>=1.40

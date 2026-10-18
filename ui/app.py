@@ -32,6 +32,7 @@ from app import tools
 from app.agent import (
     MAX_SESSION_COST_CNY,
     MAX_SESSION_STEPS,
+    answer_from_case,
     load_dotenv,
     run_case,
 )
@@ -342,28 +343,6 @@ def _denials(trace: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return [step for step in trace if _policy_decision(step) == "deny"]
 
 
-def _answer_from_case(case: Mapping[str, Any]) -> str:
-    trace = case.get("trace") or []
-    for step in reversed(trace):
-        if step.get("outcome") == "finished":
-            args = step.get("args") or {}
-            answer = args.get("final_answer") or args.get("answer") or step.get("thought")
-            if answer:
-                return str(answer)
-
-    last = trace[-1] if trace else {}
-    if last.get("breaker") == "max_steps_exceeded":
-        return "抱歉，这次处理步骤过多，系统已自动中止，请换一种说法再试。"
-    if last.get("breaker") == "cost_limit_exceeded":
-        return "抱歉，本次会话的预估成本已达到上限，系统已自动中止。"
-
-    denied = _denials(trace)
-    if denied:
-        info = denied[-1].get("policy") or {}
-        return f"抱歉，这个操作被安全中枢拦截了：{info.get('reason') or '不符合当前操作规则'}。"
-    return "抱歉，我暂时没能完成这个请求，请换个说法再试。"
-
-
 def _execute_case(
     user: str,
     text: str,
@@ -532,7 +511,7 @@ def _handle_user_message(
     st.session_state["chat_messages"].append(
         {
             "role": "assistant",
-            "content": _answer_from_case(case),
+            "content": answer_from_case(case),
             "blocked": bool(_denials(case.get("trace") or [])),
         }
     )
