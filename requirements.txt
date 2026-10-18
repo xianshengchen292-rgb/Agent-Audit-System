@@ -1,0 +1,3 @@
+# 核心 Agent / 策略 / 轨迹只使用 Python 标准库（3.10+）。
+# 审计面板需要 Streamlit（会一并安装 pandas 等依赖）。
+streamlit>=1.32
