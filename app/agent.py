@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import math
 import os
 import re
 import sys
@@ -37,15 +38,24 @@ import urllib.request
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Dict, List, Mapping, Optional, Sequence
+from uuid import uuid4
 
 try:  # 包导入：python -m app.agent
     from . import policy, tools
-    from ..trace.recorder import TraceRecorder
+    from ..trace.recorder import (
+        BREAKER_COST_LIMIT,
+        BREAKER_MAX_STEPS,
+        TraceRecorder,
+    )
 except ImportError:  # 直接运行脚本：python app/agent.py
     sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
     import app.policy as policy  # type: ignore[no-redef]
     import app.tools as tools  # type: ignore[no-redef]
-    from trace.recorder import TraceRecorder  # type: ignore[no-redef]
+    from trace.recorder import (  # type: ignore[no-redef]
+        BREAKER_COST_LIMIT,
+        BREAKER_MAX_STEPS,
+        TraceRecorder,
+    )
 
 __all__ = [
     "SYSTEM_PROMPT",
@@ -60,6 +70,10 @@ __all__ = [
     "run_case",
     "parse_decision",
     "load_dotenv",
+    "estimate_tokens",
+    "estimate_call_cost",
+    "MAX_SESSION_STEPS",
+    "MAX_SESSION_COST_CNY",
     "main",
 ]
 
@@ -67,7 +81,17 @@ DEEPSEEK_BASE_URL = "https://api.deepseek.com"
 DEEPSEEK_MODEL = "deepseek-chat"
 DEFAULT_TIMEOUT = 60.0
 DEFAULT_MAX_TOKENS = 800
-DEFAULT_MAX_STEPS = 6
+
+#: 企业级硬限制：单会话最多 5 步、预估成本最多 0.05 元。
+MAX_SESSION_STEPS = 5
+MAX_SESSION_COST_CNY = 0.05
+DEFAULT_MAX_STEPS = MAX_SESSION_STEPS
+
+#: 粗略估算 Token：中文场景按约 2 个字符 1 token 计（偏保守）。
+TOKEN_CHARS_PER_TOKEN = 2.0
+#: DeepSeek 参考价（元 / 1K tokens），仅用于成本熔断的粗略估算。
+INPUT_COST_PER_1K_CNY = 0.002
+OUTPUT_COST_PER_1K_CNY = 0.008
 
 #: 允许模型调用的工具（finish 表示结束对话）。
 TOOL_NAMES = tuple(tools.TOOL_NAMES) + ("finish",)
@@ -113,6 +137,56 @@ SYSTEM_PROMPT = """你是「订单客服 Agent」，职责是帮当前登录用�
    修正参数重试、继续查询，还是用 finish 向用户说明。
 6. 不要尝试操作别的用户的订单；不要输出任何工具调用之外的内容。
 """
+
+
+# --------------------------------------------------------------------------- #
+# Token / 成本估算（粗略但保守）
+# --------------------------------------------------------------------------- #
+def estimate_tokens(text: Any) -> int:
+    """按字符数粗略估算 Token：中文场景约 2 字符 / token。"""
+
+    raw = str(text or "")
+    if not raw:
+        return 0
+    return max(1, math.ceil(len(raw) / TOKEN_CHARS_PER_TOKEN))
+
+
+def estimate_call_cost(
+    prompt_text: Any,
+    completion_text: Any,
+    usage: Optional[Mapping[str, Any]] = None,
+) -> tuple[int, int, float]:
+    """估算一次模型调用的 Token 与人民币成本。
+
+    如果 API 返回了 ``usage``（prompt_tokens / completion_tokens），优先使用；
+    否则退化为字符数估算。返回 ``(prompt_tokens, completion_tokens, cost_cny)``。
+    """
+
+    prompt_tokens = 0
+    completion_tokens = 0
+
+    if isinstance(usage, Mapping):
+        try:
+            prompt_tokens = int(usage.get("prompt_tokens") or 0)
+            completion_tokens = int(usage.get("completion_tokens") or 0)
+        except (TypeError, ValueError):
+            prompt_tokens = 0
+            completion_tokens = 0
+
+    if prompt_tokens <= 0:
+        prompt_tokens = estimate_tokens(prompt_text)
+    if completion_tokens <= 0:
+        completion_tokens = estimate_tokens(completion_text)
+
+    cost = (
+        prompt_tokens / 1000.0 * INPUT_COST_PER_1K_CNY
+        + completion_tokens / 1000.0 * OUTPUT_COST_PER_1K_CNY
+    )
+    return prompt_tokens, completion_tokens, cost
+
+
+def _prompt_text(messages: Sequence[Mapping[str, str]]) -> str:
+    return "\n".join(str(message.get("content", "")) for message in messages)
 
 
 # --------------------------------------------------------------------------- #
@@ -171,7 +245,7 @@ class RunResult:
     """一次 run() 的结果。"""
 
     answer: str
-    stop_reason: str  # finished / max_steps / blocked / empty
+    stop_reason: str  # finished / blocked / max_steps / max_steps_exceeded / cost_limit_exceeded
     steps: List[Dict[str, Any]] = field(default_factory=list)
     trace_path: Optional[str] = None
     run_id: str = ""
@@ -305,6 +379,8 @@ class DeepSeekClient:
         self.temperature = temperature
         self.max_tokens = max_tokens
         self.use_json_mode = use_json_mode
+        #: 最近一次成功调用返回的 usage（DeepSeek 通常包含 prompt/completion tokens）
+        self.last_usage: Dict[str, Any] = {}
 
     # -- 公开接口 -------------------------------------------------------- #
     def complete(self, messages: Sequence[Mapping[str, str]]) -> str:
@@ -315,6 +391,7 @@ class DeepSeekClient:
                 "未设置 DEEPSEEK_API_KEY。请先设置环境变量，或在项目根目录创建 .env 文件。"
             )
 
+        self.last_usage = {}
         payload: Dict[str, Any] = {
             "model": self.model,
             "messages": [dict(message) for message in messages],
@@ -370,6 +447,9 @@ class DeepSeekClient:
         except json.JSONDecodeError as exc:
             raise AgentAPIError(f"DeepSeek API 返回了非 JSON 内容：{text[:300]!r}") from exc
 
+        usage = data.get("usage")
+        self.last_usage = dict(usage) if isinstance(usage, Mapping) else {}
+
         choices = data.get("choices") or []
         if not choices:
             raise AgentAPIError(f"DeepSeek API 响应缺少 choices：{text[:300]!r}")
@@ -383,14 +463,22 @@ class DeepSeekClient:
 # --------------------------------------------------------------------------- #
 # 轨迹审计
 # --------------------------------------------------------------------------- #
-_ERROR_OUTCOMES = frozenset({"blocked", "tool_error", "invalid_output"})
+_ERROR_OUTCOMES = frozenset(
+    {
+        "blocked",
+        "tool_error",
+        "invalid_output",
+        BREAKER_MAX_STEPS,
+        BREAKER_COST_LIMIT,
+    }
+)
 
 
 def find_first_error(trace: Sequence[Mapping[str, Any]]) -> Optional[Dict[str, Any]]:
     """返回轨迹里第一处异常步骤的摘要；全程正常时返回 None。
 
     异常包括：被策略拦截（blocked）、工具报错（tool_error）、模型输出非法
-    （invalid_output）。
+    （invalid_output），以及两类硬熔断（max_steps_exceeded / cost_limit_exceeded）。
     """
 
     for step in trace:
@@ -425,13 +513,17 @@ class OrderAgent:
         client: Optional[DeepSeekClient] = None,
         model: Optional[str] = None,
         max_steps: int = DEFAULT_MAX_STEPS,
+        cost_limit_cny: float = MAX_SESSION_COST_CNY,
         recorder: Optional[TraceRecorder] = None,
         trace_path: Optional[str] = None,
         verbose: bool = False,
     ) -> None:
         self.user_id = (user_id or "u1").strip()
         self.client = client or DeepSeekClient(model=model)
-        self.max_steps = max(1, int(max_steps))
+        self.requested_max_steps = max(1, int(max_steps))
+        # 企业级硬限制：无论调用方传多少，单会话最多 5 步
+        self.max_steps = min(self.requested_max_steps, MAX_SESSION_STEPS)
+        self.cost_limit_cny = max(0.0, float(cost_limit_cny))
         self.recorder = recorder or TraceRecorder(trace_path)
         self.verbose = verbose
 
@@ -456,6 +548,7 @@ class OrderAgent:
 
         user = self._resolve_user(current_user)
         answer, stop_reason, steps = self._drive(user, user_message, history)
+        self._persist_run(user, stop_reason, steps)
         return RunResult(
             answer=answer,
             stop_reason=stop_reason,
@@ -476,12 +569,12 @@ class OrderAgent:
               "first_error": None | {"step": ..., "outcome": ..., "rule": ..., "reason": ...}
             }
 
-        ``first_error`` 是第一处异常步骤（被策略拦截 / 工具报错 / 输出非法）的摘要；
-        若全程正常但步数耗尽，会给出 ``outcome="max_steps"`` 的提示。
+        ``first_error`` 是第一处异常步骤（策略拦截 / 工具报错 / 输出非法 / 硬熔断）的摘要。
         """
 
         current = self._resolve_user(user)
         _, stop_reason, steps = self._drive(current, text)
+        self._persist_run(current, stop_reason, steps)
 
         first_error = find_first_error(steps)
         if first_error is None and stop_reason == "max_steps":
@@ -498,6 +591,43 @@ class OrderAgent:
             "store_snapshot": tools.get_state(),
             "first_error": first_error,
         }
+
+    def _cost_breaker_reason(self, cost: float) -> str:
+        return (
+            f"单次会话预估成本 ¥{cost:.4f} 超过上限 ¥{self.cost_limit_cny:.2f}，"
+            "触发成本熔断"
+        )
+
+    def _cost_breaker_answer(self) -> str:
+        return (
+            f"本次会话预估成本已超过 ¥{self.cost_limit_cny:.2f}，"
+            "触发成本熔断（cost_limit_exceeded）。"
+        )
+
+    def _persist_run(
+        self,
+        user: str,
+        stop_reason: str,
+        steps: Sequence[Mapping[str, Any]],
+    ) -> None:
+        """把本次会话的步数/Token/成本/熔断结果写入 SQLite 审计表。"""
+
+        if not steps:
+            return
+        last = steps[-1]
+        try:
+            tools.record_agent_run(
+                run_id=str(last.get("session_id") or uuid4().hex),
+                user_id=user,
+                steps=int(last.get("session_steps") or 0),
+                session_tokens=int(last.get("session_tokens") or 0),
+                session_cost_cny=float(last.get("session_cost_cny") or 0.0),
+                stop_reason=stop_reason,
+                breaker=str(last["breaker"]) if last.get("breaker") else None,
+            )
+        except Exception:
+            # 运行审计表写入失败不影响主流程；JSONL 轨迹仍是主审计来源
+            pass
 
     def _resolve_user(self, current_user: Optional[str]) -> str:
         user = (current_user or self.user_id or "").strip()
@@ -528,21 +658,71 @@ class OrderAgent:
         answer = ""
         stop_reason = "max_steps"
         blocked_calls: Dict[str, int] = {}
+        session_id = uuid4().hex
+        session_tokens = 0
+        session_cost = 0.0
 
-        for _ in range(self.max_steps):
+        def common_fields() -> Dict[str, Any]:
+            return {
+                "session_id": session_id,
+                "user_id": user,
+                "user_message": user_message,
+            }
+
+        for step_no in range(1, self.max_steps + 1):
             state = tools.get_state()
+            prompt_text = _prompt_text(messages)
             started = time.perf_counter()
             reply = self.client.complete(messages)
             latency_ms = round((time.perf_counter() - started) * 1000)
 
+            usage = getattr(self.client, "last_usage", None)
+            prompt_tokens, completion_tokens, step_cost = estimate_call_cost(
+                prompt_text, reply, usage
+            )
+            step_tokens = prompt_tokens + completion_tokens
+            session_tokens += step_tokens
+            session_cost += step_cost
+            cost_exceeded = session_cost > self.cost_limit_cny
+
+            metrics: Dict[str, Any] = {
+                "step_tokens": step_tokens,
+                "step_cost_cny": round(step_cost, 6),
+                "prompt_tokens": prompt_tokens,
+                "completion_tokens": completion_tokens,
+                "session_tokens": session_tokens,
+                "session_cost_cny": round(session_cost, 6),
+                "session_steps": step_no,
+            }
+
             try:
                 decision = parse_decision(reply)
             except AgentOutputError as exc:
+                if cost_exceeded:
+                    breaker_fields = {
+                        **common_fields(),
+                        **metrics,
+                        "raw_reply": reply[:2000],
+                        "error": str(exc),
+                        "latency_ms": latency_ms,
+                        "cost_limit_cny": self.cost_limit_cny,
+                    }
+                    steps.append(
+                        self.recorder.record_breaker(
+                            BREAKER_COST_LIMIT,
+                            self._cost_breaker_reason(session_cost),
+                            **breaker_fields,
+                        )
+                    )
+                    answer = self._cost_breaker_answer()
+                    stop_reason = BREAKER_COST_LIMIT
+                    break
+
                 steps.append(
                     self.recorder.record(
                         {
-                            "user_id": user,
-                            "user_message": user_message,
+                            **common_fields(),
+                            **metrics,
                             "outcome": "invalid_output",
                             "executed": False,
                             "error": str(exc),
@@ -564,6 +744,27 @@ class OrderAgent:
                 )
                 continue
 
+            # 成本熔断：模型调用已发生，但不再执行本次决策对应的工具
+            if cost_exceeded:
+                breaker_fields = {
+                    **common_fields(),
+                    **metrics,
+                    **decision.as_trace(),
+                    "args": {**decision.args, "confidence": decision.confidence},
+                    "latency_ms": latency_ms,
+                    "cost_limit_cny": self.cost_limit_cny,
+                }
+                steps.append(
+                    self.recorder.record_breaker(
+                        BREAKER_COST_LIMIT,
+                        self._cost_breaker_reason(session_cost),
+                        **breaker_fields,
+                    )
+                )
+                answer = self._cost_breaker_answer()
+                stop_reason = BREAKER_COST_LIMIT
+                break
+
             # 结束对话：不需要走业务策略，也不算工具调用
             if decision.tool_name == "finish":
                 answer = str(
@@ -575,8 +776,8 @@ class OrderAgent:
                 steps.append(
                     self.recorder.record(
                         {
-                            "user_id": user,
-                            "user_message": user_message,
+                            **common_fields(),
+                            **metrics,
                             **decision.as_trace(),
                             "args": {**decision.args, "confidence": decision.confidence},
                             "policy": policy.Decision(True, None, "finish：结束本轮对话").to_dict(),
@@ -595,8 +796,8 @@ class OrderAgent:
             decision_result = policy.check(decision.tool_name, check_args, state, user)
 
             base_record: Dict[str, Any] = {
-                "user_id": user,
-                "user_message": user_message,
+                **common_fields(),
+                **metrics,
                 **decision.as_trace(),
                 "args": check_args,
                 "policy": decision_result.to_dict(),
@@ -670,7 +871,33 @@ class OrderAgent:
             )
 
         if stop_reason == "max_steps":
-            answer = answer or f"抱歉，我在 {self.max_steps} 步之内没有完成这个任务。"
+            if self.max_steps >= MAX_SESSION_STEPS:
+                reason = (
+                    f"已达到单次会话最大步数 {MAX_SESSION_STEPS} 步"
+                    f"（Step > {MAX_SESSION_STEPS}），强制终止"
+                )
+                breaker_fields = {
+                    **common_fields(),
+                    "session_steps": self.max_steps,
+                    "session_tokens": session_tokens,
+                    "session_cost_cny": round(session_cost, 6),
+                    "step_tokens": 0,
+                    "step_cost_cny": 0.0,
+                    "max_steps": MAX_SESSION_STEPS,
+                    "cost_limit_cny": self.cost_limit_cny,
+                }
+                steps.append(
+                    self.recorder.record_breaker(
+                        BREAKER_MAX_STEPS, reason, **breaker_fields
+                    )
+                )
+                answer = (
+                    f"已达到 {MAX_SESSION_STEPS} 步最大步数限制，"
+                    "本次任务被强制终止（max_steps_exceeded）。"
+                )
+                stop_reason = BREAKER_MAX_STEPS
+            else:
+                answer = answer or f"抱歉，我在 {self.max_steps} 步之内没有完成这个任务。"
 
         return answer, stop_reason, steps
 
@@ -684,6 +911,7 @@ def run_case(
     recorder: Optional[TraceRecorder] = None,
     trace_path: Optional[str] = None,
     max_steps: int = DEFAULT_MAX_STEPS,
+    cost_limit_cny: float = MAX_SESSION_COST_CNY,
 ) -> Dict[str, Any]:
     """模块级便捷入口：``run_case("u1", "帮我把 o1 退了")``。
 
@@ -696,6 +924,7 @@ def run_case(
         user,
         client=client,
         max_steps=max_steps,
+        cost_limit_cny=cost_limit_cny,
         recorder=recorder,
         trace_path=trace_path,
     )
@@ -730,8 +959,9 @@ def _print_steps(result: RunResult) -> None:
     for step in result.steps:
         info = step.get("policy") or {}
         flag = "ALLOW" if info.get("allowed") else "DENY "
+        tool = step.get("breaker") or step.get("tool_name") or "—"
         args = json.dumps(step.get("args") or {}, ensure_ascii=False)
-        print(f"  step {step['step']:>2}  {flag}  {step.get('tool_name'):<14} {args}")
+        print(f"  step {step['step']:>2}  {flag}  {tool:<24} {args}")
         if not info.get("allowed"):
             print(f"          规则 {info.get('rule')}：{info.get('reason')}")
         tool_result = step.get("tool_result")
@@ -792,7 +1022,8 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--message", "-m", default=None, help="只执行一轮，不进入交互模式")
     parser.add_argument("--trace", default=None, help="轨迹文件路径，默认 trace/trace.jsonl")
     parser.add_argument("--model", default=None, help="模型名，默认 deepseek-chat")
-    parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS, help="单轮最大步数")
+    parser.add_argument("--max-steps", type=int, default=DEFAULT_MAX_STEPS, help="单轮最大步数（硬上限 5）")
+    parser.add_argument("--cost-limit", type=float, default=MAX_SESSION_COST_CNY, help="单次会话预估成本上限（元）")
     parser.add_argument("--verbose", action="store_true", help="把每一步打印到 stderr")
     args = parser.parse_args(argv)
 
@@ -808,6 +1039,7 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
             args.user,
             model=args.model,
             max_steps=args.max_steps,
+            cost_limit_cny=args.cost_limit,
             trace_path=args.trace,
             verbose=args.verbose,
         )

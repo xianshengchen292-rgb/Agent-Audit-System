@@ -1,8 +1,9 @@
 """订单客服 Agent 行为审计用例。
 
-断言只检查两件事：
-1. 轨迹里每一步的 ``executed`` 字段（工具是否真的被执行）；
-2. 订单库快照里的 ``refund_count``（退款是否真的发生、是否只发生一次）。
+断言重点：
+1. 轨迹的 ``executed`` / ``breaker`` / ``session_steps`` / ``session_cost_cny``；
+2. 订单库快照里的 ``refund_count``；
+3. ``agent_runs`` 审计表里的 ``stop_reason`` / ``breaker``。
 
 不比较最终回复文本。全部用例使用 FakeClient，不访问网络。
 
@@ -16,6 +17,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 import sys
 import unittest
 from pathlib import Path
@@ -26,7 +28,7 @@ if str(PROJECT_ROOT) not in sys.path:  # 支持 python tests/test_audit.py
     sys.path.insert(0, str(PROJECT_ROOT))
 
 from app import tools
-from app.agent import OrderAgent, run_case
+from app.agent import MAX_SESSION_COST_CNY, OrderAgent, run_case
 from trace.recorder import TraceRecorder, load_trace
 
 
@@ -68,11 +70,12 @@ class AuditCaseTest(unittest.TestCase):
         self.addCleanup(lambda: self.trace_path.unlink(missing_ok=True))
 
     # -- 辅助 ------------------------------------------------------------ #
-    def make_agent(self, replies, *, user="u1", max_steps=6):
+    def make_agent(self, replies, *, user="u1", max_steps=6, cost_limit_cny=MAX_SESSION_COST_CNY):
         agent = OrderAgent(
             user,
             client=FakeClient(replies),
             max_steps=max_steps,
+            cost_limit_cny=cost_limit_cny,
             recorder=TraceRecorder(self.trace_path, reset=True),
         )
         self.addCleanup(agent.close)
@@ -206,6 +209,63 @@ class AuditCaseTest(unittest.TestCase):
         self.assertEqual([step["tool_name"] for step in self.executed(case)], ["query_order"])
         self.assertEqual(case["store_snapshot"]["refund_count"], 0)
         self.assertIsNone(case["first_error"])
+
+    # -- 用例 5：超过 5 步硬熔断 ----------------------------------------- #
+    def test_max_steps_breaker(self):
+        replies = [decision("query_order", {"order_id": "o1"}) for _ in range(6)]
+        agent = self.make_agent(replies, max_steps=10)
+        case = agent.run_case("u1", "反复查询 o1")
+
+        last = case["trace"][-1]
+        self.assertEqual(last["outcome"], "max_steps_exceeded")
+        self.assertEqual(last["breaker"], "max_steps_exceeded")
+        self.assertIs(last["executed"], False)
+        self.assertEqual(last["session_steps"], 5)
+        self.assertEqual(case["first_error"]["rule"], "max_steps_exceeded")
+
+        # 5 次真实模型决策 + 1 条熔断记录；第 6 次模型调用不会发生
+        self.assertEqual(len(case["trace"]), 6)
+        self.assertEqual(len(self.executed(case)), 5)
+        self.assertEqual(agent.client.calls, 5)
+
+        connection = sqlite3.connect(str(tools.DB_PATH))
+        try:
+            row = connection.execute(
+                "SELECT steps, stop_reason, breaker FROM agent_runs"
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(row, (5, "max_steps_exceeded", "max_steps_exceeded"))
+
+    # -- 用例 6：成本熔断 ------------------------------------------------ #
+    def test_cost_limit_breaker(self):
+        agent = self.make_agent(
+            [decision("query_order", {"order_id": "o1"})],
+            max_steps=3,
+            cost_limit_cny=0.000001,
+        )
+        case = agent.run_case("u1", "查一下 o1")
+
+        last = case["trace"][-1]
+        self.assertEqual(last["outcome"], "cost_limit_exceeded")
+        self.assertEqual(last["breaker"], "cost_limit_exceeded")
+        self.assertIs(last["executed"], False)
+        self.assertEqual(last["session_steps"], 1)
+        self.assertGreater(last["session_cost_cny"], 0.000001)
+        self.assertEqual(case["first_error"]["rule"], "cost_limit_exceeded")
+
+        # 预算已熔断，决策里的 query_order 不得执行
+        self.assertEqual(self.executed(case), [])
+        self.assertEqual(case["store_snapshot"]["orders"]["o1"]["status"], "paid")
+
+        connection = sqlite3.connect(str(tools.DB_PATH))
+        try:
+            row = connection.execute(
+                "SELECT steps, stop_reason, breaker FROM agent_runs"
+            ).fetchone()
+        finally:
+            connection.close()
+        self.assertEqual(row, (1, "cost_limit_exceeded", "cost_limit_exceeded"))
 
 
 if __name__ == "__main__":

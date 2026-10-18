@@ -6,8 +6,9 @@
 
     {
       "step": 1,                 # 全局单调递增
-      "run_id": "20261018T...",  # 一次会话
+      "run_id": "20261018T...",  # 记录器实例 ID
       "ts": "2026-10-18T09:49:37+00:00",
+      "session_id": "a1b2c3...", # 单次 Agent 会话 ID
       "user_id": "u1",
       "user_message": "帮我把 o1 退了吧",
       "thought": "...",
@@ -17,8 +18,14 @@
       "confidence": 0.92,
       "policy": {"allowed": false, "rule": "not_cancelled", "reason": "..."},
       "tool_result": null,
-      "outcome": "blocked"
+      "outcome": "blocked",
+      "session_steps": 1,
+      "session_tokens": 1234,
+      "session_cost_cny": 0.0031
     }
+
+熔断会额外写入 ``breaker`` / ``outcome``（``max_steps_exceeded`` 或
+``cost_limit_exceeded``），并由 ``record_breaker()`` 统一生成。
 
 ``locate_first_error(expected, actual)`` 用期望轨迹和实际轨迹逐步对比，
 返回第一处不一致的位置；完全一致时返回 ``None``。
@@ -38,12 +45,20 @@ __all__ = [
     "TraceRecorder",
     "DEFAULT_TRACE_PATH",
     "DEFAULT_COMPARE_FIELDS",
+    "BREAKER_MAX_STEPS",
+    "BREAKER_COST_LIMIT",
+    "BREAKER_TYPES",
     "load_trace",
     "locate_first_error",
     "format_first_error",
 ]
 
 DEFAULT_TRACE_PATH = Path(__file__).resolve().parents[1] / "trace" / "trace.jsonl"
+
+#: 两类硬熔断：超过最大步数、超过单会话预估成本。
+BREAKER_MAX_STEPS = "max_steps_exceeded"
+BREAKER_COST_LIMIT = "cost_limit_exceeded"
+BREAKER_TYPES = frozenset({BREAKER_MAX_STEPS, BREAKER_COST_LIMIT})
 
 #: 默认只比对行为相关字段；``policy.allowed`` 在期望轨迹里没有时会自动跳过。
 DEFAULT_COMPARE_FIELDS: tuple[str, ...] = ("tool_name", "args", "policy.allowed")
@@ -129,6 +144,28 @@ class TraceRecorder:
         self._handle.write(_dumps(payload) + "\n")
         self._handle.flush()
         return payload
+
+    def record_breaker(self, breaker: str, reason: str, **fields: Any) -> dict[str, Any]:
+        """记录一次硬熔断（步数超限 / 成本超限）。
+
+        breaker 必须是 ``BREAKER_MAX_STEPS`` 或 ``BREAKER_COST_LIMIT``。
+        写入的步骤会带 ``breaker`` 字段、``outcome`` 与固定的 deny policy，
+        供面板 / 断言直接识别。
+        """
+
+        if breaker not in BREAKER_TYPES:
+            raise ValueError(f"未知熔断类型：{breaker!r}")
+
+        payload: dict[str, Any] = dict(fields)
+        payload.update(
+            {
+                "outcome": breaker,
+                "breaker": breaker,
+                "executed": False,
+                "policy": {"allowed": False, "rule": breaker, "reason": reason},
+            }
+        )
+        return self.record(payload)
 
     def read(self) -> list[dict[str, Any]]:
         """读回当前文件里的全部步骤。"""
